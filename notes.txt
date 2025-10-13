@@ -1,0 +1,65 @@
+python run_training.py \
+  --work-dir OUTPUT-01/backpack --port 6010  data:iphone --data.data-dir data/backpack
+
+PYTHONPATH='.' python scripts/evaluate_iphone.py \
+  --data_dir data/backpack  --result_dir OUTPUT-01/backpack --seq_names backpack
+
+
+
+
+python run_training.py \
+  --work-dir OUTPUT-01/v4 --port 6010  data:custom --data.data-dir data/c3vd/v4
+
+PYTHONPATH='.' python scripts/evaluate_custom.py \
+  --data_dir data/c3vd/v4 --result_dir OUTPUT-01/v4 --pred_subdir OUTPUT-01/v4/results/rgb --mask_type masks --save_json OUTPUT-01/v4metrics.json
+
+
+
+PYTHONPATH='.' python scripts/evaluate_iphone.py \
+  --data_dir data/c3vd/v4 --result_dir OUTPUT-01/v4 --seq_names v4
+
+
+python run_training.py \
+  --work-dir OUTPUT-01/v4-1 --port 6010  data:custom --data.data-dir data/c3vd/v4
+
+
+
+
+
+python process_c3vd.py --input_dir /home/ubuntu/deform-colon/data/v4 \
+--output_dir data/c3vd-v2/v4 --image_subdir rgb --depth_subdir depth \
+--track_model cotracker --track_out_name cotracker --grid_size 32 --gpu 0
+
+
+
+PYTHONPATH="." python run_training.py \
+  --work-dir OUTPUT_bootstapir/v4 --port 8900  data:c3vd \
+  --data.data-dir /home/ubuntu/deform-colon/shape-of-motion/data/c3vd-v2/v4 \
+  --data.track_2d_type bootstapir
+
+PYTHONPATH="." python run_training.py \
+  --work-dir OUTPUT_bootstapir/v4-2d --port 8900  data:c3vd \
+  --data.data-dir /home/ubuntu/deform-colon/shape-of-motion/data/c3vd-v2/v4 \
+  --data.track_2d_type bootstapir --use_2dgs True
+
+python run_video.py \
+  --work-dir OUTPUT-02/v4-0 --port 6010  data:c3vd --data.data-dir data/c3vd-v2/v4 \
+  trajectory:arc time:replay
+
+
+PYTHONPATH='.' python scripts/evaluate_custom.py \
+  --data_dir data/c3vd-v2 --result_dir OUTPUT-02 --seq_names v4 \
+  --tracks_subdir depths --camera_file pose.txt --intrinsics_file intrinsics.json \
+  --depth_subdir depths --tracks_subdir bootstapir
+
+
+python run_training.py \
+  --work_dir /home/ubuntu/deform-colon/shape-of-motion/OUTPUT_visdebug/v4_demo \
+  --vis_debug \
+  --port 8900 \
+  --num_epochs 1 \
+  --batch_size 2 \
+  data:c3vd \
+    --data.data_dir /home/ubuntu/deform-colon/shape-of-motion/data/c3vd-v2/v4 \
+    --data.max_frames 16 \
+    --data.val_stride 0
