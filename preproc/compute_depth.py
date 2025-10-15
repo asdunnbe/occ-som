@@ -49,8 +49,17 @@ def get_depth_anything_disp(
 
     image = Image.open(img_file)
     disp = pipe(image)["predicted_depth"]
+
+    if isinstance(disp, np.ndarray):
+        disp = torch.from_numpy(disp)
+
+    if disp.ndim == 2:
+        disp = disp.unsqueeze(0).unsqueeze(0)
+    elif disp.ndim == 3:
+        disp = disp.unsqueeze(0)
+
     disp = torch.nn.functional.interpolate(
-        disp.unsqueeze(1), size=image.size[::-1], mode="bicubic", align_corners=False
+        disp, size=image.size[::-1], mode="bicubic", align_corners=False
     )
     disp = disp.squeeze().cpu().numpy()
     if ret_type == "uint16":

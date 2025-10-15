@@ -1,7 +1,8 @@
 import functools
 import time
 from dataclasses import asdict
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -40,6 +41,9 @@ class Trainer:
         validate_every: int = 500,
         validate_video_every: int = 1000,
         validate_viewer_assets_every: int = 100,
+        gaussian_knn_k: int | None = None,
+        graph_save_every: int | None = None,
+        viewer_graph_max_edges: int = 0,
     ):
         self.device = device
         self.log_every = log_every
@@ -50,6 +54,24 @@ class Trainer:
 
         self.model = model
         self.num_frames = model.num_frames
+        self.gaussian_knn_k = (
+            gaussian_knn_k if gaussian_knn_k is not None and gaussian_knn_k > 0 else None
+        )
+        self._graph_initialized = False
+        self.model.disable_knn_graph()
+
+        if graph_save_every is None:
+            self.graph_save_every = checkpoint_every
+        else:
+            self.graph_save_every = int(graph_save_every)
+        if self.graph_save_every < 0:
+            self.graph_save_every = 0
+        self.graph_save_dir = Path(work_dir) / "graphs"
+        self._last_saved_graph_step = -1
+
+        self.viewer_graph_max_edges = max(0, int(viewer_graph_max_edges))
+        self._viewer_graph_handles: list[Any] = []
+        self._graph_rng = np.random.default_rng()
 
         self.lr_cfg = lr_cfg
         self.losses_cfg = losses_cfg
@@ -73,6 +95,8 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=work_dir)
         self.global_step = 0
         self.epoch = 0
+
+        self._maybe_initialize_graph()
 
         self.viewer = None
         if port is not None:
@@ -116,7 +140,10 @@ class Trainer:
         path: str, device: torch.device, use_2dgs, *args, **kwargs
     ) -> tuple["Trainer", int]:
         guru.info(f"Loading checkpoint from {path}")
-        ckpt = torch.load(path)
+        try:
+            ckpt = torch.load(path, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(path)
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict)
         model = model.to(device)
@@ -141,8 +168,20 @@ class Trainer:
             v.load_state_dict(sched_ckpt[k])
 
     @torch.inference_mode()
-    def render_fn(self, camera_state: CameraState, img_wh: tuple[int, int]):
-        W, H = img_wh
+    def render_fn(
+        self,
+        camera_state: CameraState,
+        render_state,  # RenderTabState in newer nerfview, Tuple[int, int] in older releases.
+    ):
+        if hasattr(render_state, "viewer_width") and hasattr(
+            render_state, "viewer_height"
+        ):
+            W = int(render_state.viewer_width)
+            H = int(render_state.viewer_height)
+            img_wh = (W, H)
+        else:
+            W, H = render_state
+            img_wh = render_state
 
         focal = 0.5 * H / np.tan(0.5 * camera_state.fov).item()
         K = torch.tensor(
@@ -153,19 +192,26 @@ class Trainer:
             torch.from_numpy(camera_state.c2w.astype(np.float32)).to(self.device)
         )
         t = 0
-        if self.viewer is not None:
-            t = (
-                int(self.viewer._playback_guis[0].value)
-                if not self.viewer._canonical_checkbox.value
-                else None
-            )
+        if self.viewer is not None and hasattr(self.viewer, "_playback_guis"):
+            canonical_checkbox = getattr(self.viewer, "_canonical_checkbox", None)
+            if canonical_checkbox is not None and canonical_checkbox.value:
+                t = None
+            else:
+                t = int(self.viewer._playback_guis[0].value)
         self.model.training = False
         img = self.model.render(t, w2c[None], K[None], img_wh)["img"][0]
         return (img.cpu().numpy() * 255.0).astype(np.uint8)
 
     def train_step(self, batch):
         if self.viewer is not None:
-            while self.viewer.state.status == "paused":
+            while True:
+                viewer_state = getattr(self.viewer, "state", None)
+                if hasattr(viewer_state, "status"):
+                    is_paused = viewer_state.status == "paused"
+                else:
+                    is_paused = viewer_state == "paused"
+                if not is_paused:
+                    break
                 time.sleep(0.1)
             self.viewer.lock.acquire()
 
@@ -180,18 +226,46 @@ class Trainer:
         for opt in self.optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
+        if self._graph_initialized:
+            self.model.mark_knn_graph_dirty()
         for sched in self.scheduler.values():
             sched.step()
 
         self.log_dict(stats)
         self.global_step += 1
+        self._maybe_initialize_graph()
         self.run_control_steps()
+
+        should_save_graph = (
+            self._graph_initialized
+            and self.graph_save_every > 0
+            and self.global_step > 0
+            and self.global_step % self.graph_save_every == 0
+            and self.global_step != self._last_saved_graph_step
+        )
+        should_update_viewer_graph = (
+            self.viewer is not None
+            and self._graph_initialized
+            and self.viewer_graph_max_edges > 0
+            and self.validate_viewer_assets_every > 0
+            and self.global_step > 0
+            and self.global_step % self.validate_viewer_assets_every == 0
+        )
+
+        if should_save_graph or should_update_viewer_graph:
+            self.model.rebuild_knn_graph()
+        if should_save_graph:
+            self.save_graph_snapshot()
 
         if self.viewer is not None:
             self.viewer.lock.release()
-            self.viewer.state.num_train_rays_per_sec = num_rays_per_sec
+            viewer_state = getattr(self.viewer, "state", None)
+            if hasattr(viewer_state, "num_train_rays_per_sec"):
+                viewer_state.num_train_rays_per_sec = num_rays_per_sec
             if self.viewer.mode == "training":
                 self.viewer.update(self.global_step, num_rays_per_step)
+            if should_update_viewer_graph:
+                self._update_viewer_graph()
 
         if self.global_step % self.checkpoint_every == 0:
             self.save_checkpoint(f"{self.work_dir}/checkpoints/last.ckpt")
@@ -334,7 +408,7 @@ class Trainer:
             surf_normals = surf_normals.reshape(rendered_normals.shape)
             cos_sim = torch.sum(rendered_normals * surf_normals, dim=-1)
             normal_loss = (1 - cos_sim).mean()
-            loss += normal_loss * 0.05
+            loss += normal_loss * 0.05                  # NOTE: small normal loss weight
 
 
         # RGB loss.
@@ -441,6 +515,8 @@ class Trainer:
         )
         loss += small_accel_loss * self.losses_cfg.w_smooth_bases
 
+
+# ======= Eucidian space constraints =======
         # tracks should be smooth
         ts = torch.clamp(ts, min=1, max=num_frames - 2)
         ts_neighbors = torch.cat((ts - 1, ts, ts + 1))
@@ -461,6 +537,7 @@ class Trainer:
             )
             loss += small_accel_loss_tracks * self.losses_cfg.w_smooth_tracks
 
+# ========================================
 
         # Constrain the std of scales.
         # TODO: do we want to penalize before or after exp?
@@ -530,6 +607,114 @@ class Trainer:
         for k, v in stats.items():
             self.writer.add_scalar(k, v, self.global_step)
 
+    def _maybe_initialize_graph(self) -> None:
+        if self._graph_initialized or self.gaussian_knn_k is None:
+            return
+        warmup_steps = getattr(self.optim_cfg, "warmup_steps", 0)
+        if self.global_step < warmup_steps:
+            return
+        self.model.enable_knn_graph(self.gaussian_knn_k)
+        self._graph_initialized = True
+        guru.info(
+            f"Initialized Gaussian K-NN graph with k={self.gaussian_knn_k} at step {self.global_step}."
+        )
+
+    def _refresh_knn_graph(self) -> None:
+        if not self._graph_initialized:
+            return
+        self.model.rebuild_knn_graph()
+
+    def save_graph_snapshot(self) -> None:
+        if not self._graph_initialized:
+            return
+        indices, distances = self.model.get_knn_graph()
+        if indices is None or distances is None:
+            return
+        means = self.model.get_canonical_means_all().detach().cpu()
+        snapshot = {
+            "step": int(self.global_step),
+            "k": int(self.gaussian_knn_k),
+            "indices": indices.cpu(),
+            "distances": distances.cpu(),
+            "means": means,
+        }
+        self.graph_save_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.graph_save_dir / f"graph_step_{self.global_step:08d}.pt"
+        torch.save(snapshot, out_path)
+        self._last_saved_graph_step = self.global_step
+        guru.info(f"Saved gaussian graph snapshot to {out_path}")
+
+    def _clear_viewer_graph(self) -> None:
+        if not self._viewer_graph_handles:
+            return
+        for handle in self._viewer_graph_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._viewer_graph_handles = []
+
+    def _update_viewer_graph(self) -> None:
+        if (
+            self.viewer is None
+            or self.viewer_graph_max_edges <= 0
+            or not self._graph_initialized
+        ):
+            return
+        server = getattr(self.viewer, "server", None)
+        if server is None:
+            return
+
+        segments = self.model.get_knn_segments()
+        if segments.numel() == 0:
+            self._clear_viewer_graph()
+            return
+        segments_np = segments.detach().cpu().numpy()
+        num_edges = segments_np.shape[0]
+        if num_edges > self.viewer_graph_max_edges:
+            choice = self._graph_rng.choice(
+                num_edges, size=self.viewer_graph_max_edges, replace=False
+            )
+            segments_np = segments_np[choice]
+
+        weights = np.linalg.norm(segments_np[:, 0] - segments_np[:, 1], axis=-1)
+        if weights.size == 0:
+            weights_norm = np.zeros_like(weights)
+        else:
+            weights_norm = (weights - weights.min()) / (weights.ptp() + 1e-8)
+
+        self._clear_viewer_graph()
+        handles: list[Any] = []
+
+        node_positions = self.model.get_canonical_means_all().detach().cpu().numpy()
+        if node_positions.shape[0] > 0:
+            node_colors = np.tile(
+                np.array([[0.2, 0.8, 1.0]], dtype=np.float32),
+                (node_positions.shape[0], 1),
+            )
+            handles.append(
+                server.scene.add_point_cloud(
+                    "/graph/nodes",
+                    points=node_positions,
+                    colors=node_colors,
+                    point_size=0.01,
+                )
+            )
+
+        for idx, (segment, wn) in enumerate(zip(segments_np, weights_norm)):
+            color = (float(wn), float(1.0 - wn), 0.2)
+            handles.append(
+                server.scene.add_spline_catmull_rom(
+                    f"/graph/edges/{idx}",
+                    positions=segment,
+                    color=color,
+                    segments=1,
+                    line_width=0.002,
+                )
+            )
+
+        self._viewer_graph_handles = handles
+
     def run_control_steps(self):
         global_step = self.global_step
         # Adaptive gaussian control.
@@ -572,23 +757,59 @@ class Trainer:
         for _current_xys, _current_radii, _current_img_wh in zip(
             self._batched_xys, self._batched_radii, self._batched_img_wh
         ):
-            sel = _current_radii > 0
-            gidcs = torch.where(sel)[1]
-            # normalize grads to [-1, 1] screen space
-            xys_grad = _current_xys.grad.clone()
-            xys_grad[..., 0] *= _current_img_wh[0] / 2.0 * batch_size
-            xys_grad[..., 1] *= _current_img_wh[1] / 2.0 * batch_size
-            self.running_stats["xys_grad_norm_acc"].index_add_(
-                0, gidcs, xys_grad[sel].norm(dim=-1)
-            )
-            self.running_stats["vis_count"].index_add_(
-                0, gidcs, torch.ones_like(gidcs, dtype=torch.int64)
-            )
-            max_radii = torch.maximum(
-                self.running_stats["max_radii"].index_select(0, gidcs),
-                _current_radii[sel] / max(_current_img_wh),
-            )
-            self.running_stats["max_radii"].index_put((gidcs,), max_radii)
+            radii_tensor = _current_radii
+            xys_tensor = _current_xys
+
+            if radii_tensor.ndim == 2:
+                radii_tensor = radii_tensor.unsqueeze(0)
+                xys_tensor = xys_tensor.unsqueeze(0)
+
+            if isinstance(_current_img_wh, torch.Tensor):
+                if _current_img_wh.ndim == 0:
+                    img_wh_tensor = _current_img_wh.reshape(1, 1)
+                elif _current_img_wh.ndim == 1:
+                    img_wh_tensor = _current_img_wh.unsqueeze(0)
+                else:
+                    img_wh_tensor = _current_img_wh
+            else:
+                img_wh_tensor = _current_img_wh
+
+            num_views = radii_tensor.shape[0]
+            for view_idx in range(num_views):
+                radii_view = radii_tensor[view_idx]
+                xys_grad_view = xys_tensor.grad[view_idx]
+
+                if isinstance(img_wh_tensor, torch.Tensor):
+                    wh_view = img_wh_tensor[view_idx] if img_wh_tensor.ndim > 1 else img_wh_tensor[0]
+                    width = float(wh_view[0].item()) if wh_view.ndim > 0 else float(wh_view.item())
+                    height = float(wh_view[1].item()) if wh_view.ndim > 0 else float(wh_view.item())
+                elif isinstance(img_wh_tensor, (list, tuple)):
+                    entry = img_wh_tensor[view_idx] if len(img_wh_tensor) > 2 and isinstance(img_wh_tensor[0], (list, tuple, torch.Tensor)) else img_wh_tensor
+                    width, height = entry
+                else:
+                    width = height = float(_current_img_wh)
+
+                visibility_axes = radii_view > 0
+                visible_gaussians = visibility_axes.any(dim=-1)
+                gidcs = torch.where(visible_gaussians)[0]
+                if gidcs.numel() == 0:
+                    continue
+
+                xys_grad_view[..., 0] *= width / 2.0 * batch_size
+                xys_grad_view[..., 1] *= height / 2.0 * batch_size
+
+                grad_norm = xys_grad_view[visible_gaussians].norm(dim=-1)
+                self.running_stats["xys_grad_norm_acc"].index_add_(0, gidcs, grad_norm)
+                self.running_stats["vis_count"].index_add_(
+                    0, gidcs, torch.ones_like(gidcs, dtype=torch.int64)
+                )
+
+                radii_vals = radii_view[visible_gaussians].amax(dim=-1)
+                max_radii = torch.maximum(
+                    self.running_stats["max_radii"].index_select(0, gidcs),
+                    radii_vals / max(width, height),
+                )
+                self.running_stats["max_radii"].index_put((gidcs,), max_radii)
         return True
 
     @torch.no_grad()
@@ -662,6 +883,7 @@ class Trainer:
                 dim=0,
             )
             self.running_stats[k] = new_v
+        self._refresh_knn_graph()
         guru.info(
             f"Split {should_split.sum().item()} gaussians, "
             f"Duplicated {should_dup.sum().item()} gaussians, "
@@ -710,6 +932,7 @@ class Trainer:
         for k, v in self.running_stats.items():
             self.running_stats[k] = v[~should_cull]
 
+        self._refresh_knn_graph()
         guru.info(
             f"Culled {should_cull.sum().item()} gaussians, "
             f"{self.model.num_gaussians} gaussians left"
@@ -720,11 +943,16 @@ class Trainer:
         # Reset gaussian opacities.
         new_val = torch.logit(torch.tensor(0.8 * self.optim_cfg.cull_opacity_threshold))
         for part in ["fg", "bg"]:
-            part_params = getattr(self.model, part).reset_opacities(new_val)
+            module = getattr(self.model, part, None)
+            if module is None:
+                continue
+            part_params = module.reset_opacities(new_val)
             # Modify optimizer states by new assignment.
             for param_name, new_params in part_params.items():
                 full_param_name = f"{part}.params.{param_name}"
-                optimizer = self.optimizers[full_param_name]
+                optimizer = self.optimizers.get(full_param_name)
+                if optimizer is None:
+                    continue
                 reset_in_optim(optimizer, [new_params])
         guru.info("Reset opacities")
 

@@ -577,16 +577,20 @@ def sample_initial_bases_centers(
     else:
         model = HDBSCAN(min_cluster_size=20, max_cluster_size=num_tracks // 4)
     model.fit(vel_dirs)
-    labels = model.labels_
-    num_bases = labels.max().item() + 1
+    labels_np = model.labels_
+    if hasattr(labels_np, "get"):
+        labels_np = labels_np.get()
+    labels_np = np.asarray(labels_np)
+    num_bases = int(labels_np.max()) + 1
+    labels_t = torch.from_numpy(labels_np.astype(np.int64)).to(means_canonical.device)
     sampled_centers = torch.stack(
         [
-            means_canonical[torch.tensor(labels == i)].median(dim=0).values
+            means_canonical[labels_t == i].median(dim=0).values
             for i in range(num_bases)
         ]
     )[None]
     print("number of {} clusters: ".format(mode), num_bases)
-    return sampled_centers, num_bases, torch.tensor(labels)
+    return sampled_centers, num_bases, labels_t.cpu()
 
 
 def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarray:

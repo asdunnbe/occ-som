@@ -3,7 +3,6 @@ import os
 import os.path as osp
 import time
 from dataclasses import asdict
-from typing import cast
 
 import imageio as iio
 import numpy as np
@@ -20,11 +19,23 @@ from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.data.utils import normalize_coords, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.scene_model import SceneModel
-from flow3d.vis.utils import (
-    apply_depth_colormap,
-    make_video_divisble,
-    plot_correspondences,
-)
+from flow3d.vis.utils import apply_depth_colormap, draw_tracks_2d, make_video_divisble
+
+
+def _sanitize_depth_map(depth_map: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    sanitized = depth_map.clone()
+    if sanitized.numel() == 0:
+        return sanitized
+    finite_mask = torch.isfinite(sanitized)
+    if not torch.all(finite_mask):
+        sanitized = torch.where(finite_mask, sanitized, sanitized.new_full((), eps))
+    positive_mask = sanitized > eps
+    if positive_mask.any():
+        min_positive = torch.clamp_min(sanitized[positive_mask].min(), eps)
+    else:
+        min_positive = sanitized.new_full((), eps)
+    sanitized = torch.where(positive_mask, sanitized, min_positive)
+    return sanitized
 
 
 class Validator:
@@ -57,6 +68,9 @@ class Validator:
         self.bg_ssim_metric = mSSIM()
         self.bg_lpips_metric = mLPIPS().to(device)
         self.pck_metric = PCK()
+
+        self._pointcloud_dir = osp.join(self.save_dir, "results", "pointcloud")
+        os.makedirs(self._pointcloud_dir, exist_ok=True)
 
     def reset_metrics(self):
         self.psnr_metric.reset()
@@ -104,8 +118,10 @@ class Validator:
             # (H, W).
             covisible_mask = batch.get(
                 "covisible_masks",
-                torch.ones_like(fg_mask)[None],
+                torch.ones_like(fg_mask),
             )
+            if covisible_mask.dim() == fg_mask.dim() + 1 and covisible_mask.shape[1] == 1:
+                covisible_mask = covisible_mask[:, 0]
             W, H = img_wh = img[0].shape[-2::-1]
             rendered = self.model.render(t, w2c, K, img_wh, return_depth=True)
 
@@ -116,18 +132,21 @@ class Validator:
             bg_valid_mask = (1 - fg_mask) * valid_mask
             main_valid_mask = valid_mask if self.has_bg else fg_valid_mask
 
-            self.psnr_metric.update(rendered["img"], img, main_valid_mask)
-            self.ssim_metric.update(rendered["img"], img, main_valid_mask)
-            self.lpips_metric.update(rendered["img"], img, main_valid_mask)
+            if torch.count_nonzero(main_valid_mask) > 0:
+                self.psnr_metric.update(rendered["img"], img, main_valid_mask)
+                self.ssim_metric.update(rendered["img"], img, main_valid_mask)
+                self.lpips_metric.update(rendered["img"], img, main_valid_mask)
 
             if self.has_bg:
-                self.fg_psnr_metric.update(rendered["img"], img, fg_valid_mask)
-                self.fg_ssim_metric.update(rendered["img"], img, fg_valid_mask)
-                self.fg_lpips_metric.update(rendered["img"], img, fg_valid_mask)
+                if torch.count_nonzero(fg_valid_mask) > 0:
+                    self.fg_psnr_metric.update(rendered["img"], img, fg_valid_mask)
+                    self.fg_ssim_metric.update(rendered["img"], img, fg_valid_mask)
+                    self.fg_lpips_metric.update(rendered["img"], img, fg_valid_mask)
 
-                self.bg_psnr_metric.update(rendered["img"], img, bg_valid_mask)
-                self.bg_ssim_metric.update(rendered["img"], img, bg_valid_mask)
-                self.bg_lpips_metric.update(rendered["img"], img, bg_valid_mask)
+                if torch.count_nonzero(bg_valid_mask) > 0:
+                    self.bg_psnr_metric.update(rendered["img"], img, bg_valid_mask)
+                    self.bg_ssim_metric.update(rendered["img"], img, bg_valid_mask)
+                    self.bg_lpips_metric.update(rendered["img"], img, bg_valid_mask)
 
             # Dump results.
             results_dir = osp.join(self.save_dir, "results", "rgb")
@@ -137,16 +156,24 @@ class Validator:
                 (rendered["img"][0].cpu().numpy() * 255).astype(np.uint8),
             )
 
+        def _maybe_compute(metric, default=float("nan")):
+            try:
+                if len(metric):
+                    return metric.compute()
+            except ValueError:
+                pass
+            return torch.tensor(default, device=self.device)
+
         return {
-            "val/psnr": self.psnr_metric.compute(),
-            "val/ssim": self.ssim_metric.compute(),
-            "val/lpips": self.lpips_metric.compute(),
-            "val/fg_psnr": self.fg_psnr_metric.compute(),
-            "val/fg_ssim": self.fg_ssim_metric.compute(),
-            "val/fg_lpips": self.fg_lpips_metric.compute(),
-            "val/bg_psnr": self.bg_psnr_metric.compute(),
-            "val/bg_ssim": self.bg_ssim_metric.compute(),
-            "val/bg_lpips": self.bg_lpips_metric.compute(),
+            "val/psnr": _maybe_compute(self.psnr_metric),
+            "val/ssim": _maybe_compute(self.ssim_metric),
+            "val/lpips": _maybe_compute(self.lpips_metric),
+            "val/fg_psnr": _maybe_compute(self.fg_psnr_metric),
+            "val/fg_ssim": _maybe_compute(self.fg_ssim_metric),
+            "val/fg_lpips": _maybe_compute(self.fg_lpips_metric),
+            "val/bg_psnr": _maybe_compute(self.bg_psnr_metric),
+            "val/bg_ssim": _maybe_compute(self.bg_ssim_metric),
+            "val/bg_lpips": _maybe_compute(self.bg_lpips_metric),
         }
 
     @torch.no_grad()
@@ -155,7 +182,14 @@ class Validator:
             return
         pred_keypoints_3d_all = []
         time_ids = self.val_kpt_loader.dataset.time_ids.tolist()
-        h, w = self.val_kpt_loader.dataset.dataset.imgs.shape[1:3]
+
+        dataset = self.val_kpt_loader.dataset.dataset
+        if isinstance(getattr(dataset, "imgs", None), torch.Tensor):
+            h, w = dataset.imgs.shape[1:3]
+        else:
+            sample_idx = int(self.val_kpt_loader.dataset.time_ids[0].item())
+            sample_img = dataset.get_image(sample_idx)
+            h, w = sample_img.shape[:2]
         pred_train_depths = np.zeros((len(time_ids), h, w))
 
         for batch in tqdm(self.val_kpt_loader, desc="render val keypoints"):
@@ -225,6 +259,8 @@ class Validator:
             "w2cs": all_w2cs[time_ids].cpu().numpy(),
             "pred_keypoints_3d": np.stack(pred_keypoints_3d_all, 0),
             "pred_train_depths": pred_train_depths,
+            "time_ids": np.asarray(time_ids, dtype=np.int32),
+            "orig_time_ids": self.val_kpt_loader.dataset.original_time_ids.cpu().numpy(),
         }
 
         results_dir = osp.join(self.save_dir, "results")
@@ -279,10 +315,12 @@ class Validator:
             video.append(torch.cat([img, rendered["img"][0]], dim=1).cpu())
             ref_pred_depth = torch.cat(
                 (depth[..., None], rendered["depth"][0]), dim=1
-            ).cpu()
-            ref_pred_depths.append(ref_pred_depth)
-            depth_min = min(depth_min, ref_pred_depth.min().item())
-            depth_max = max(depth_max, ref_pred_depth.quantile(0.99).item())
+            )
+            ref_pred_depth = _sanitize_depth_map(ref_pred_depth)
+            ref_pred_depth_cpu = ref_pred_depth.cpu()
+            ref_pred_depths.append(ref_pred_depth_cpu)
+            depth_min = min(depth_min, ref_pred_depth_cpu.min().item())
+            depth_max = max(depth_max, ref_pred_depth_cpu.quantile(0.99).item())
             if rendered["mask"] is not None:
                 masks.append(rendered["mask"][0].cpu().squeeze(-1))
             if rendered["rend_normal"] is not None:
@@ -317,7 +355,15 @@ class Validator:
         for depth in ref_pred_depths:
             c2w = torch.linalg.inv(w2c)
             K_cpu = K
-            surf_normal = depth_to_normal(depth[None].to(c2w.device), c2w[None], K_cpu[None], depth_min, depth_max)
+            near_plane = max(depth_min, 1e-3)
+            far_plane = max(depth_max, near_plane + 1e-3)
+            surf_normal = depth_to_normal(
+                depth[None].to(c2w.device),
+                c2w[None],
+                K_cpu[None],
+                near_plane,
+                far_plane,
+            )
             # import pdb
             # pdb.set_trace()
             surf_normal = (surf_normal * 0.5 + 0.5).cpu()
@@ -355,15 +401,16 @@ class Validator:
                 fps=fps,
             )
 
-        # Render 2D track video.
-        tracks_2d, target_imgs = [], []
-        sample_interval = 10
+        # Render 2D track video with GT (left) vs prediction (right).
+        pred_tracks_per_frame, gt_tracks_per_frame, target_imgs = [], [], []
+        max_tracks_video = 1024
         batch0 = {
             k: v.to(self.device) if isinstance(v, torch.Tensor) else v
             for k, v in self.train_loader.dataset[0].items()
         }
         # ().
         t = batch0["ts"]
+        query_idx = int(t)
         # (4, 4).
         w2c = batch0["w2cs"]
         # (3, 3).
@@ -371,8 +418,39 @@ class Validator:
         # (H, W, 3).
         img = batch0["imgs"]
         # (H, W).
-        bool_mask = batch0["masks"] > 0.5
+        mask = batch0["masks"] > 0.5
+        query_tracks = batch0.get("query_tracks_2d")
+        if query_tracks is None or query_tracks.numel() == 0:
+            guru.warning("No query tracks available; skipping tracks_2d.mp4 rendering")
+            pred_tracks_per_frame = []
+        else:
+            query_tracks = query_tracks.to(self.device)
+        H, W = img.shape[:2]
         img_wh = img.shape[-2::-1]
+        if query_tracks is not None and query_tracks.numel() > 0:
+            num_query_tracks = query_tracks.shape[0]
+            if num_query_tracks > max_tracks_video:
+                track_sel = torch.randperm(num_query_tracks, device=self.device)[
+                    : max_tracks_video
+                ].sort().values
+                query_tracks = query_tracks[track_sel]
+            else:
+                track_sel = torch.arange(num_query_tracks, device=self.device)
+            # Ensure we only visualize points inside current foreground mask.
+            if mask is not None and mask.any():
+                mask_tensor = mask.float().flatten()
+                y_idx = torch.round(query_tracks[..., 1]).long().clamp(0, H - 1)
+                x_idx = torch.round(query_tracks[..., 0]).long().clamp(0, W - 1)
+                flat_indices = y_idx * W + x_idx
+                valid_mask = mask_tensor[flat_indices] > 0
+                if valid_mask.any():
+                    query_tracks = query_tracks[valid_mask]
+                    track_sel = track_sel[valid_mask]
+            track_sel_cpu = track_sel.cpu()
+            query_grid = normalize_coords(query_tracks, H, W)
+        else:
+            track_sel_cpu = torch.empty(0, dtype=torch.long)
+            query_grid = None
         for batch in tqdm(
             self.train_loader, desc="Rendering 2D track video", leave=False
         ):
@@ -398,26 +476,48 @@ class Validator:
                 target_ts=target_ts,
                 target_w2cs=target_w2cs,
             )
-            pred_tracks_3d = rendered["tracks_3d"][0][
-                ::sample_interval, ::sample_interval
-            ][bool_mask[::sample_interval, ::sample_interval]].swapaxes(0, 1)
-            pred_tracks_2d = torch.einsum("bij,bpj->bpi", target_Ks, pred_tracks_3d)
+            if query_grid is None or query_grid.numel() == 0:
+                continue
+            target_idx = int(target_ts[0].item())
+            tracks_3d_map = rendered["tracks_3d"][0].permute(2, 3, 0, 1)
+            B = tracks_3d_map.shape[0]
+            sample_grid = query_grid.unsqueeze(0).unsqueeze(2).expand(B, -1, -1, -1)
+            sampled_tracks_3d = F.grid_sample(
+                tracks_3d_map,
+                sample_grid,
+                mode="bilinear",
+                align_corners=True,
+                padding_mode="border",
+            )
+            sampled_tracks_3d = sampled_tracks_3d.squeeze(-1).permute(0, 2, 1)
+            pred_tracks_2d = torch.einsum(
+                "bij,bpj->bpi", target_Ks, sampled_tracks_3d
+            )
             pred_tracks_2d = pred_tracks_2d[..., :2] / torch.clamp(
                 pred_tracks_2d[..., 2:], min=1e-6
             )
-            tracks_2d.append(pred_tracks_2d.cpu())
-        tracks_2d = torch.cat(tracks_2d, dim=0)
-        target_imgs = torch.cat(target_imgs, dim=0)
-        track_2d_video = plot_correspondences(
-            target_imgs.numpy(),
-            tracks_2d.numpy(),
-            query_id=cast(int, t),
-        )
-        iio.mimwrite(
-            osp.join(video_dir, "tracks_2d.mp4"),
-            make_video_divisble(np.stack(track_2d_video, 0)),
-            fps=fps,
-        )
+            pred_tracks_per_frame.append(pred_tracks_2d[0].detach().cpu())
+            gt_tracks = self.train_loader.dataset.load_target_tracks(
+                query_idx, [target_idx], dim=1
+            )
+            gt_tracks = gt_tracks[track_sel_cpu, 0, :2].float()
+            gt_tracks_per_frame.append(gt_tracks)
+        if pred_tracks_per_frame:
+            target_imgs = torch.cat(target_imgs, dim=0)
+            pred_tracks = torch.stack(pred_tracks_per_frame, dim=0)
+            gt_tracks = torch.stack(gt_tracks_per_frame, dim=0)
+            frames = []
+            for frame_idx in range(target_imgs.shape[0]):
+                gt_hist = gt_tracks[: frame_idx + 1].permute(1, 0, 2)
+                pred_hist = pred_tracks[: frame_idx + 1].permute(1, 0, 2)
+                gt_img = draw_tracks_2d(target_imgs[frame_idx], gt_hist)
+                pred_img = draw_tracks_2d(target_imgs[frame_idx], pred_hist)
+                frames.append(np.concatenate([gt_img, pred_img], axis=1))
+            iio.mimwrite(
+                osp.join(video_dir, "tracks_2d.mp4"),
+                make_video_divisble(np.stack(frames, 0)),
+                fps=fps,
+            )
         # Render motion coefficient video.
         with torch.random.fork_rng():
             torch.random.manual_seed(0)
@@ -428,9 +528,12 @@ class Validator:
         motion_coef_colors = (motion_coef_colors - motion_coef_colors.min(0)[0]) / (
             motion_coef_colors.max(0)[0] - motion_coef_colors.min(0)[0]
         )
-        motion_coef_colors = F.pad(
-            motion_coef_colors, (0, 0, 0, self.model.bg.num_gaussians), value=0.5
-        )
+        bg = getattr(self.model, "bg", None)
+        bg_count = getattr(bg, "num_gaussians", 0) if bg is not None else 0
+        if bg_count > 0:
+            motion_coef_colors = F.pad(
+                motion_coef_colors, (0, 0, 0, bg_count), value=0.5
+            )
         video = []
         for batch in tqdm(
             self.train_loader, desc="Rendering motion coefficient video", leave=False

@@ -2,7 +2,7 @@ import argparse
 import glob
 import os
 
-import imageio
+import imageio.v2 as imageio
 import mediapy as media
 import numpy as np
 import torch
@@ -11,7 +11,9 @@ from tqdm import tqdm
 
 
 def read_video(folder_path):
+    print(folder_path)
     frame_paths = sorted(glob.glob(os.path.join(folder_path, "*")))
+
     video = np.stack([imageio.imread(frame_path) for frame_path in frame_paths])
     print(f"{video.shape=} {video.dtype=} {video.min()=} {video.max()=}")
     video = media._VideoArray(video)
@@ -46,7 +48,7 @@ def main():
     parser.add_argument(
         "--ckpt_dir",
         type=str,
-        default="checkpoints",
+        default="preproc/checkpoints",
         help="checkpoint dir",
     )
     args = parser.parse_args()
@@ -91,6 +93,20 @@ def main():
 
     video = read_video(folder_path)
     num_frames, height, width = video.shape[0:3]
+
+    if not os.path.isdir(mask_dir):
+        os.makedirs(mask_dir, exist_ok=True)
+
+    existing_masks = {
+        os.path.basename(path): path for path in glob.glob(os.path.join(mask_dir, "*"))
+    }
+    if len(existing_masks) < len(frame_names):
+        # Ensure every frame has a mask by filling in any missing files 
+        empty_mask = np.full((height, width), 1, dtype=np.uint8)
+        for name in frame_names:
+            if name not in existing_masks:
+                imageio.imwrite(os.path.join(mask_dir, name), empty_mask)
+
     masks = read_video(mask_dir)
     masks = (masks.reshape((num_frames, height, width, -1)) > 0).any(axis=-1)
     print(f"{video.shape=} {masks.shape=} {masks.max()=} {masks.sum()=}")

@@ -59,6 +59,8 @@ class CustomDataConfig:
     data_dir: str
     start: int = 0
     end: int = -1
+    max_frames: int | None = 120
+    val_stride: int = 8
     res: str = ""
     image_type: str = "images"
     mask_type: str = "masks"
@@ -69,7 +71,7 @@ class CustomDataConfig:
         "depth_anything_v2",
         "unidepth_disp",
     ] = "aligned_depth_anything"
-    camera_type: Literal["droid_recon", "megasam"] = "megasam"
+    camera_type: Literal["droid_recon", "megasam"] = "droid_recon"
     track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir"
     mask_erosion_radius: int = 7
     scene_norm_dict: tyro.conf.Suppress[SceneNormDict | None] = None
@@ -83,6 +85,7 @@ class CasualDataset(BaseDataset):
         data_dir: str,
         start: int = 0,
         end: int = -1,
+        max_frames: int | None = None,
         res: str = "480p",
         image_type: str = "JPEGImages",
         mask_type: str = "Annotations",
@@ -93,14 +96,16 @@ class CasualDataset(BaseDataset):
             "depth_anything_v2",
             "unidepth_disp",
         ] = "aligned_depth_anything",
-        camera_type: Literal["droid_recon", "megasam"] = "megasam",
+        camera_type: Literal["droid_recon", "megasam"] = "droid_recon",
         track_2d_type: Literal["bootstapir", "tapir"] = "bootstapir",
         mask_erosion_radius: int = 3,
         scene_norm_dict: SceneNormDict | None = None,
-        num_targets_per_frame: int = 4,
-        load_from_cache: bool = False,
-        **_,
-    ):
+    num_targets_per_frame: int = 4,
+    load_from_cache: bool = False,
+    frame_stride: int = 1,
+    split: Literal["train", "val"] = "train",
+    **_,
+):
         super().__init__()
 
         self.data_dir = data_dir
@@ -111,6 +116,7 @@ class CasualDataset(BaseDataset):
         self.has_validation = False
         self.mask_erosion_radius = mask_erosion_radius
         self.camera_type = camera_type
+        self._max_frames = max_frames
 
         self.img_dir = f"{data_dir}/{image_type}/{res}"
         self.img_ext = os.path.splitext(os.listdir(self.img_dir)[0])[1]
@@ -118,28 +124,45 @@ class CasualDataset(BaseDataset):
         self.mask_dir = f"{data_dir}/{mask_type}/{res}"
         self.tracks_dir = f"{data_dir}/{track_2d_type}/{res}"
         self.cache_dir = f"{data_dir}/flow3d_preprocessed/{res}"
+        self.split = split
+        self.frame_stride = max(1, frame_stride)
+
         frame_names = [os.path.splitext(p)[0] for p in sorted(os.listdir(self.img_dir))]
 
-        if end == -1:
-            end = len(frame_names)
+        total_frames = len(frame_names)
+        if end == -1 or end > total_frames:
+            end = total_frames
+        if self._max_frames is not None:
+            end = min(end, start + self._max_frames)
+        end = max(start, min(end, total_frames))
+
+        base_indices = list(range(start, end))
+        frame_idcs = base_indices[:: self.frame_stride]
+        if not frame_idcs:
+            raise ValueError(
+                f"No frames selected for dataset with frame_stride={self.frame_stride}."
+            )
+
         self.start = start
-        # end = 71
-        end = len(frame_names)
         self.end = end
-        self.frame_names = frame_names[start:end]
+        self.frame_idcs = torch.tensor(frame_idcs, dtype=torch.long)
+        self.frame_names = [frame_names[i] for i in frame_idcs]
 
         self.imgs: list[torch.Tensor | None] = [None for _ in self.frame_names]
         self.depths: list[torch.Tensor | None] = [None for _ in self.frame_names]
         self.masks: list[torch.Tensor | None] = [None for _ in self.frame_names]
 
         # load cameras
+        print(camera_type)
+
         if camera_type == "droid_recon":
             img = self.get_image(0)
             H, W = img.shape[:2]
             w2cs, Ks, tstamps = load_cameras(
                 f"{data_dir}/{camera_type}.npy", H, W
             )
-            
+            w2cs = w2cs[self.frame_idcs]
+            Ks = Ks[self.frame_idcs]
         elif camera_type == "megasam":
             data_name = data_dir.split("/")[-1]
             cam_path = Path(data_dir) / f"{data_name}.npz"
@@ -150,6 +173,9 @@ class CasualDataset(BaseDataset):
             c2ws = torch.from_numpy(c2ws)
             w2cs = torch.linalg.inv(c2ws)
             Ks = torch.from_numpy(K).unsqueeze(0).repeat((c2ws.shape[0], 1, 1))
+            w2cs = w2cs[self.frame_idcs]
+            Ks = Ks[self.frame_idcs]
+            tstamps = torch.arange(start, end)
                 
         else:
             raise ValueError(f"Unknown camera type: {camera_type}")
@@ -158,11 +184,20 @@ class CasualDataset(BaseDataset):
             len(self.frame_names) == len(w2cs) == len(Ks)
         ), f"{len(self.frame_names)}, {len(w2cs)}, {len(Ks)}"
 
-        self.w2cs = w2cs[start:end]
-        self.Ks = Ks[start:end]
-        tstamps = torch.from_numpy(np.arange(0, end))
-        tmask = (tstamps >= start) & (tstamps < end)
-        self._keyframe_idcs = tstamps[tmask] - start
+        self.w2cs = w2cs
+        self.Ks = Ks
+        if not torch.is_tensor(tstamps):
+            tstamps = torch.from_numpy(tstamps)
+        frame_idx_map = {int(idx): pos for pos, idx in enumerate(self.frame_idcs.tolist())}
+        selected = [
+            frame_idx_map[int(ts.item())]
+            for ts in tstamps
+            if int(ts.item()) in frame_idx_map
+        ]
+        if selected:
+            self._keyframe_idcs = torch.tensor(selected, dtype=torch.long)
+        else:
+            self._keyframe_idcs = torch.arange(len(self.frame_names), dtype=torch.long)
         self.scale = 1
 
         if scene_norm_dict is None:
@@ -394,7 +429,8 @@ class CasualDataset(BaseDataset):
             overlap_mask[bmin_y:bmax_y, bmin_x:bmax_x] = 0
 
             bool_mask &= overlap_mask
-            if bool_mask.sum() < min_per_frame:
+            available = int(bool_mask.sum().item())
+            if available == 0:
                 guru.debug(f"skipping {query_idx=}")
                 continue
 
@@ -412,16 +448,21 @@ class CasualDataset(BaseDataset):
             point_normals = normal_from_depth_image(depth, K, w2c)[bool_mask]
             point_colors = img[bool_mask]
 
-
-            # points = bg_pts_3d[bool_mask]
-
             num_sel = max(len(points) // down_rate, min_per_frame)
+            num_sel = min(num_sel, len(points))
             sel_idcs = np.random.choice(len(points), num_sel, replace=False)
             points = points[sel_idcs]
             point_normals = point_normals[sel_idcs]
             point_colors = point_colors[sel_idcs]
             guru.debug(f"{query_idx=} {points.shape=}")
             bg_geometry.append((points, point_normals, point_colors))
+
+        if not bg_geometry:
+            guru.warning(
+                "No background pixels detected across frames; returning empty tensors."
+            )
+            empty = torch.empty((0, 3), dtype=torch.float32)
+            return empty, empty.clone(), empty.clone()
 
         bg_points, bg_normals, bg_colors = map(
             partial(torch.cat, dim=0), zip(*bg_geometry)
@@ -437,8 +478,10 @@ class CasualDataset(BaseDataset):
         return bg_points, bg_normals, bg_colors
 
     def __getitem__(self, index: int):
-        index = np.random.randint(0, self.num_frames)
-        # index = 0
+        if self.split == "train":
+            index = np.random.randint(0, self.num_frames)
+        else:
+            index = int(index) % self.num_frames
         data = {
             # ().
             "frame_names": self.frame_names[index],

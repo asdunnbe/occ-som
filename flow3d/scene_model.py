@@ -37,6 +37,13 @@ class SceneModel(nn.Module):
 
         self.use_2dgs = use_2dgs
 
+        # Optional K-NN graph tracking.
+        self.knn_graph_k: int | None = None
+        self._knn_neighbor_indices: torch.Tensor | None = None
+        self._knn_neighbor_distances: torch.Tensor | None = None
+        self._knn_graph_dirty = False
+        self._knn_graph_source_device: torch.device | None = None
+
     @property
     def num_gaussians(self) -> int:
         return self.num_bg_gaussians + self.num_fg_gaussians
@@ -284,6 +291,12 @@ class SceneModel(nn.Module):
             w2cs = w2cs[t].unsqueeze(0)
 
         if self.use_2dgs:
+            if colors_override.dim() == 2:
+                colors_override = (
+                    colors_override.unsqueeze(0)
+                    .expand(C, -1, -1)
+                    .contiguous()
+                )
             colors_override = torch.nan_to_num(colors_override, nan=1e-6)
             backgrounds = torch.nan_to_num(bg_color, nan=1.0)
 
@@ -293,7 +306,7 @@ class SceneModel(nn.Module):
                 scales=scales,
                 opacities=opacities,
                 colors=colors_override,
-                backgrounds=bg_color,
+                backgrounds=backgrounds,
                 viewmats=curr_w2cs,  # [C, 4, 4]
                 Ks=Ks,  # [C, 3, 3]
                 width=W,
@@ -352,3 +365,145 @@ class SceneModel(nn.Module):
         out_dict["rend_normal"] = render_normals
         out_dict["surf_normal"] = surf_normals
         return out_dict
+
+    def get_canonical_means_all(self) -> torch.Tensor:
+        """
+        Returns the canonical-space means for foreground (and background if present)
+        without applying motion transforms.
+        """
+        fg_means = self.fg.params["means"]
+        if self.bg is None:
+            return fg_means
+        return torch.cat([fg_means, self.bg.params["means"]], dim=0)
+
+    def enable_knn_graph(self, k: int | None) -> None:
+        """
+        Enable maintenance of a K-NN graph over all gaussians. Passing None or a
+        non-positive value disables the graph entirely.
+        """
+        if k is None or k <= 0:
+            self.disable_knn_graph()
+            return
+        self.knn_graph_k = int(k)
+        self._knn_graph_dirty = True
+        self.rebuild_knn_graph()
+
+    def disable_knn_graph(self) -> None:
+        """Disable K-NN tracking and clear any cached graph data."""
+        self.knn_graph_k = None
+        self._knn_neighbor_indices = None
+        self._knn_neighbor_distances = None
+        self._knn_graph_dirty = False
+        self._knn_graph_source_device = None
+
+    def mark_knn_graph_dirty(self) -> None:
+        """Mark the stored graph as stale so it will be recomputed on demand."""
+        if self.knn_graph_k is not None:
+            self._knn_graph_dirty = True
+
+    @torch.no_grad()
+    def rebuild_knn_graph(self) -> None:
+        """
+        Recompute the cached K-NN graph if enabled. Uses scikit-learn's KD-tree /
+        Ball-tree implementation to avoid O(N^2) memory usage.
+        """
+        if self.knn_graph_k is None:
+            return
+        if not self._knn_graph_dirty and self._knn_neighbor_indices is not None:
+            return
+
+        all_means = self.get_canonical_means_all().detach()
+        num_gaussians = all_means.shape[0]
+
+        if num_gaussians <= 1:
+            self._knn_neighbor_indices = torch.empty(
+                (num_gaussians, 0), dtype=torch.long
+            )
+            self._knn_neighbor_distances = torch.empty(
+                (num_gaussians, 0), dtype=torch.float32
+            )
+            self._knn_graph_source_device = all_means.device
+            self._knn_graph_dirty = False
+            return
+
+        effective_k = min(self.knn_graph_k, num_gaussians - 1)
+        if effective_k <= 0:
+            self._knn_neighbor_indices = torch.empty(
+                (num_gaussians, 0), dtype=torch.long
+            )
+            self._knn_neighbor_distances = torch.empty(
+                (num_gaussians, 0), dtype=torch.float32
+            )
+            self._knn_graph_source_device = all_means.device
+            self._knn_graph_dirty = False
+            return
+
+        means_cpu = all_means.cpu().numpy()
+
+        try:
+            from sklearn.neighbors import NearestNeighbors
+        except ImportError as exc:
+            raise ImportError(
+                "scikit-learn is required to build the Gaussian K-NN graph."
+            ) from exc
+        knn_model = NearestNeighbors(
+            n_neighbors=effective_k + 1, algorithm="auto", metric="euclidean"
+        ).fit(means_cpu)
+        distances, indices = knn_model.kneighbors(means_cpu)
+
+        # Remove self neighbor (the first element).
+        indices = indices[:, 1:]
+        distances = distances[:, 1:]
+
+        self._knn_neighbor_indices = torch.from_numpy(indices.astype("int64"))
+        self._knn_neighbor_distances = torch.from_numpy(distances.astype("float32"))
+        self._knn_graph_source_device = all_means.device
+        self._knn_graph_dirty = False
+
+    def get_knn_graph(
+        self, device: torch.device | None = None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """
+        Returns:
+            indices: (G, K) neighbor indices
+            distances: (G, K) neighbor distances
+
+        By default the cached tensors live on CPU. Provide ``device`` to receive copies
+        on a different device for downstream processing.
+        """
+        if self.knn_graph_k is None:
+            return None, None
+        self.rebuild_knn_graph()
+        if self._knn_neighbor_indices is None or self._knn_neighbor_distances is None:
+            return None, None
+        if device is None:
+            return self._knn_neighbor_indices, self._knn_neighbor_distances
+        return (
+            self._knn_neighbor_indices.to(device),
+            self._knn_neighbor_distances.to(device),
+        )
+
+    @torch.no_grad()
+    def get_knn_segments(self) -> torch.Tensor:
+        """
+        Returns:
+            segments: (E, 2, 3) tensor where each row contains the endpoints of an edge.
+        """
+        means = self.get_canonical_means_all().detach()
+        indices, _ = self.get_knn_graph(device=means.device)
+        if indices is None or indices.numel() == 0:
+            return torch.empty((0, 2, 3), device=means.device)
+
+        src = torch.arange(indices.shape[0], device=indices.device).unsqueeze(-1)
+        src = src.expand_as(indices).reshape(-1)
+        dst = indices.reshape(-1)
+
+        # Keep one directed edge to avoid duplicates for visualization.
+        mask = src < dst
+        src = src[mask]
+        dst = dst[mask]
+
+        segments = torch.stack(
+            [means[src], means[dst]], dim=1
+        )  # (E, 2, 3)
+        return segments

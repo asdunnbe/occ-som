@@ -15,7 +15,7 @@ def main(
     if len(img_dirs) > 0 and img_name not in img_dirs[0]:
         raise ValueError(f"Expecting {img_name} in {img_dirs[0]}")
 
-    script_name = "compute_tracks_torch.py" if use_torch else "compute_tracks_jax.py"
+    script_name = "compute_tracks_torch.py"
     with ProcessPoolExecutor(max_workers=len(gpus)) as executor:
         for i, img_dir in enumerate(img_dirs):
             gpu = gpus[i % len(gpus)]

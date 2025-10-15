@@ -187,7 +187,6 @@ class C3VDDataset(BaseDataset):
         self.masks: list[torch.Tensor | None] = [None for _ in self.frame_names]
 
         # load cameras
-
         if camera_type == "pose_txt":
             if not self.pose_path.exists():
                 raise FileNotFoundError(f"Missing pose file: {self.pose_path}")
@@ -370,8 +369,6 @@ class C3VDDataset(BaseDataset):
         :param dim (int), default 1: dimension to stack the time axis
         return (N, T, 4) if dim=1, (T, N, 4) if dim=0
         """
-        if self.track_2d_type == "cotracker":
-            return self._load_cotracker_tracks(query_index, target_indices, dim)
 
         q_name = self.frame_names[query_index]
         all_tracks = []
@@ -381,26 +378,6 @@ class C3VDDataset(BaseDataset):
             tracks = np.load(path).astype(np.float32)
             all_tracks.append(tracks)
         return torch.from_numpy(np.stack(all_tracks, axis=dim))
-
-    def _load_cotracker_tracks(
-        self, query_index: int, target_indices: list[int], dim: int
-    ) -> torch.Tensor:
-        q_name = self.frame_names[query_index]
-
-        # Fallback: pairwise .npy files produced by compute_tracker_cotracker.py
-        all_tracks = []
-        for target_idx in target_indices:
-            t_name = self.frame_names[target_idx]
-            pair_path = osp.join(self.tracks_dir, f"{q_name}_{t_name}.npy")
-            if not osp.exists(pair_path):
-                raise FileNotFoundError(
-                    f"Missing CoTracker track file: {pair_path} (also looked for {path})"
-                )
-            pair_arr = np.load(pair_path).astype(np.float32)
-            all_tracks.append(pair_arr)
-
-        stacked = np.stack(all_tracks, axis=dim)
-        return torch.from_numpy(stacked.astype(np.float32))
 
     def get_tracks_3d(
         self, num_samples: int, start: int = 0, end: int = -1, step: int = 1, **kwargs

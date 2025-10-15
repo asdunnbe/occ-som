@@ -61,6 +61,7 @@ def process_sequence(
         f"{dev_arg} python compute_metric_depth.py --img-dir {img_dir} "
         f"--depth-dir {metric_depth_dir} --intrins-file {intrins_name}.json"
     )
+    print('\n\n', metric_depth_cmd, '\n\n')
     subprocess.call(metric_depth_cmd, shell=True, executable="/bin/bash")
 
     mono_depth_cmd = (
@@ -68,14 +69,14 @@ def process_sequence(
         f"--out_raw_dir {mono_depth_dir} --out_aligned_dir {aligned_depth_dir} "
         f"--model {depth_model} --metric_dir {metric_depth_dir}"
     )
-    print(mono_depth_cmd)
+    print('\n\n', mono_depth_cmd, '\n\n')
     subprocess.call(mono_depth_cmd, shell=True, executable="/bin/bash")
 
     slam_cmd = (
         f"{dev_arg} python recon_with_depth.py --img_dir {img_dir} "
         f"--calib {intrins_name}.json --depth_dir {aligned_depth_dir} --out_path {slam_path}"
     )
-    print(slam_cmd)
+    print('\n\n', slam_cmd, '\n\n')
     subprocess.call(slam_cmd, shell=True, executable="/bin/bash")
 
     track_script = "compute_tracks_torch.py" if tapir_torch else "compute_tracks_jax.py"
@@ -83,8 +84,18 @@ def process_sequence(
         f"{dev_arg} python {track_script} --image_dir {img_dir} "
         f"--mask_dir {mask_dir} --out_dir {track_dir} --model_type {track_model}"
     )
+    print('\n\n', track_cmd, '\n\n')
     subprocess.call(track_cmd, shell=True, executable="/bin/bash")
 
 
 if __name__ == "__main__":
     tyro.cli(main)
+
+
+'''
+python process_custom.py --img-dirs /home/ubuntu/deform-colon/shape-of-motion/data/c3vd/v3/images/ --gpus 0
+
+python process_custom.py --img-dirs /home/ubuntu/deform-colon/shape-of-motion/data/c3vd/v4/images/ --gpus 0
+
+
+'''
