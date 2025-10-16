@@ -401,16 +401,15 @@ class Validator:
                 fps=fps,
             )
 
-        # Render 2D track video with GT (left) vs prediction (right).
-        pred_tracks_per_frame, gt_tracks_per_frame, target_imgs = [], [], []
-        max_tracks_video = 1024
+                # Render 2D track video.
+        tracks_2d, target_imgs = [], []
+        sample_interval = 10
         batch0 = {
             k: v.to(self.device) if isinstance(v, torch.Tensor) else v
             for k, v in self.train_loader.dataset[0].items()
         }
         # ().
         t = batch0["ts"]
-        query_idx = int(t)
         # (4, 4).
         w2c = batch0["w2cs"]
         # (3, 3).
@@ -418,39 +417,8 @@ class Validator:
         # (H, W, 3).
         img = batch0["imgs"]
         # (H, W).
-        mask = batch0["masks"] > 0.5
-        query_tracks = batch0.get("query_tracks_2d")
-        if query_tracks is None or query_tracks.numel() == 0:
-            guru.warning("No query tracks available; skipping tracks_2d.mp4 rendering")
-            pred_tracks_per_frame = []
-        else:
-            query_tracks = query_tracks.to(self.device)
-        H, W = img.shape[:2]
+        bool_mask = batch0["masks"] > 0.5
         img_wh = img.shape[-2::-1]
-        if query_tracks is not None and query_tracks.numel() > 0:
-            num_query_tracks = query_tracks.shape[0]
-            if num_query_tracks > max_tracks_video:
-                track_sel = torch.randperm(num_query_tracks, device=self.device)[
-                    : max_tracks_video
-                ].sort().values
-                query_tracks = query_tracks[track_sel]
-            else:
-                track_sel = torch.arange(num_query_tracks, device=self.device)
-            # Ensure we only visualize points inside current foreground mask.
-            if mask is not None and mask.any():
-                mask_tensor = mask.float().flatten()
-                y_idx = torch.round(query_tracks[..., 1]).long().clamp(0, H - 1)
-                x_idx = torch.round(query_tracks[..., 0]).long().clamp(0, W - 1)
-                flat_indices = y_idx * W + x_idx
-                valid_mask = mask_tensor[flat_indices] > 0
-                if valid_mask.any():
-                    query_tracks = query_tracks[valid_mask]
-                    track_sel = track_sel[valid_mask]
-            track_sel_cpu = track_sel.cpu()
-            query_grid = normalize_coords(query_tracks, H, W)
-        else:
-            track_sel_cpu = torch.empty(0, dtype=torch.long)
-            query_grid = None
         for batch in tqdm(
             self.train_loader, desc="Rendering 2D track video", leave=False
         ):
@@ -476,48 +444,26 @@ class Validator:
                 target_ts=target_ts,
                 target_w2cs=target_w2cs,
             )
-            if query_grid is None or query_grid.numel() == 0:
-                continue
-            target_idx = int(target_ts[0].item())
-            tracks_3d_map = rendered["tracks_3d"][0].permute(2, 3, 0, 1)
-            B = tracks_3d_map.shape[0]
-            sample_grid = query_grid.unsqueeze(0).unsqueeze(2).expand(B, -1, -1, -1)
-            sampled_tracks_3d = F.grid_sample(
-                tracks_3d_map,
-                sample_grid,
-                mode="bilinear",
-                align_corners=True,
-                padding_mode="border",
-            )
-            sampled_tracks_3d = sampled_tracks_3d.squeeze(-1).permute(0, 2, 1)
-            pred_tracks_2d = torch.einsum(
-                "bij,bpj->bpi", target_Ks, sampled_tracks_3d
-            )
+            pred_tracks_3d = rendered["tracks_3d"][0][
+                ::sample_interval, ::sample_interval
+            ][bool_mask[::sample_interval, ::sample_interval]].swapaxes(0, 1)
+            pred_tracks_2d = torch.einsum("bij,bpj->bpi", target_Ks, pred_tracks_3d)
             pred_tracks_2d = pred_tracks_2d[..., :2] / torch.clamp(
                 pred_tracks_2d[..., 2:], min=1e-6
             )
-            pred_tracks_per_frame.append(pred_tracks_2d[0].detach().cpu())
-            gt_tracks = self.train_loader.dataset.load_target_tracks(
-                query_idx, [target_idx], dim=1
-            )
-            gt_tracks = gt_tracks[track_sel_cpu, 0, :2].float()
-            gt_tracks_per_frame.append(gt_tracks)
-        if pred_tracks_per_frame:
-            target_imgs = torch.cat(target_imgs, dim=0)
-            pred_tracks = torch.stack(pred_tracks_per_frame, dim=0)
-            gt_tracks = torch.stack(gt_tracks_per_frame, dim=0)
-            frames = []
-            for frame_idx in range(target_imgs.shape[0]):
-                gt_hist = gt_tracks[: frame_idx + 1].permute(1, 0, 2)
-                pred_hist = pred_tracks[: frame_idx + 1].permute(1, 0, 2)
-                gt_img = draw_tracks_2d(target_imgs[frame_idx], gt_hist)
-                pred_img = draw_tracks_2d(target_imgs[frame_idx], pred_hist)
-                frames.append(np.concatenate([gt_img, pred_img], axis=1))
-            iio.mimwrite(
-                osp.join(video_dir, "tracks_2d.mp4"),
-                make_video_divisble(np.stack(frames, 0)),
-                fps=fps,
-            )
+            tracks_2d.append(pred_tracks_2d.cpu())
+        tracks_2d = torch.cat(tracks_2d, dim=0)
+        target_imgs = torch.cat(target_imgs, dim=0)
+        track_2d_video = plot_correspondences(
+            target_imgs.numpy(),
+            tracks_2d.numpy(),
+            query_id=cast(int, t),
+        )
+        iio.mimwrite(
+            osp.join(video_dir, "tracks_2d.mp4"),
+            make_video_divisble(np.stack(track_2d_video, 0)),
+            fps=fps,
+        )
         # Render motion coefficient video.
         with torch.random.fork_rng():
             torch.random.manual_seed(0)
