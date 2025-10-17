@@ -14,12 +14,13 @@ from pytorch_msssim import SSIM
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from typing import cast
 
 from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.data.utils import normalize_coords, to_device
 from flow3d.metrics import PCK, mLPIPS, mPSNR, mSSIM
 from flow3d.scene_model import SceneModel
-from flow3d.vis.utils import apply_depth_colormap, draw_tracks_2d, make_video_divisble
+from flow3d.vis.utils import apply_depth_colormap, draw_tracks_2d, make_video_divisble, plot_correspondences
 
 
 def _sanitize_depth_map(depth_map: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:

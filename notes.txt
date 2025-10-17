@@ -37,6 +37,11 @@ PYTHONPATH="." python run_training.py \
   --data.data-dir /home/ubuntu/deform-colon/shape-of-motion/data/c3vd-v2/v4 \
   --data.track_2d_type bootstapir
 
+PYTHONPATH="." python run_training_modified.py \
+  --work-dir /home/ubuntu/rhardy-us-east-1/code/endo-splat/models/som/c3vdv2/c2_transverse1_t1_v4 --port 8900 data:c3vd \
+  --data.data-dir /home/ubuntu/rhardy-us-east-1/code/endo-splat/data/som/c3vdv2/c2_transverse1_t1_v4 \
+  --data.track_2d_type bootstapir
+
 PYTHONPATH="." python run_training.py \
   --work-dir OUTPUT_bootstapir/v4-2d --port 8900  data:c3vd \
   --data.data-dir /home/ubuntu/deform-colon/shape-of-motion/data/c3vd-v2/v4 \
