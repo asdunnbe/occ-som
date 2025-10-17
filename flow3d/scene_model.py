@@ -6,7 +6,9 @@ from gsplat.rendering import rasterization
 from gsplat.rendering import rasterization_2dgs
 from torch import Tensor
 
+from flow3d.configs import SurfaceModuleConfig
 from flow3d.params import GaussianParams, MotionBases, CameraScales, CameraPoses
+from flow3d.surface_module import SurfaceModule
 
 
 class SceneModel(nn.Module):
@@ -43,6 +45,7 @@ class SceneModel(nn.Module):
         self._knn_neighbor_distances: torch.Tensor | None = None
         self._knn_graph_dirty = False
         self._knn_graph_source_device: torch.device | None = None
+        self.surface_module: SurfaceModule | None = None
 
     @property
     def num_gaussians(self) -> int:
@@ -139,6 +142,12 @@ class SceneModel(nn.Module):
         if self.bg is not None:
             scales = torch.cat([scales, self.bg.get_scales()], dim=0).contiguous()
         return scales
+
+    def get_quats_all(self) -> torch.Tensor:
+        quats = self.fg.get_quats()
+        if self.bg is not None:
+            quats = torch.cat([quats, self.bg.get_quats()], dim=0).contiguous()
+        return quats
 
     def get_opacities_all(self) -> torch.Tensor:
         """
@@ -375,6 +384,49 @@ class SceneModel(nn.Module):
         if self.bg is None:
             return fg_means
         return torch.cat([fg_means, self.bg.params["means"]], dim=0)
+
+    def init_surface_module(self, cfg: SurfaceModuleConfig) -> None:
+        """
+        Initialize the MLS surface module with the provided configuration.
+        """
+        self.surface_module = SurfaceModule(cfg)
+        self.update_surface_module(force=True)
+
+    def update_surface_module(self, force: bool = False) -> None:
+        if self.surface_module is None:
+            return
+        means = self.get_canonical_means_all().detach()
+        quats = self.get_quats_all().detach()
+        scales = self.get_scales_all().detach()
+        self.surface_module.update_from_gaussians(means, quats, scales)
+
+    def get_surface_points(self, device: torch.device | None = None) -> torch.Tensor:
+        if self.surface_module is None:
+            return torch.empty((0, 3), device=device or self.Ks.device)
+        return self.surface_module.get_surface_points(device=device)
+
+    def get_surface_normals(self, device: torch.device | None = None) -> torch.Tensor:
+        if self.surface_module is None:
+            return torch.empty((0, 3), device=device or self.Ks.device)
+        return self.surface_module.get_surface_normals(device=device)
+
+    def get_surface_graph(
+        self, device: torch.device | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.surface_module is None:
+            empty_idx = torch.empty(
+                (0, 0), dtype=torch.long, device=device or self.Ks.device
+            )
+            empty_dist = torch.empty((0, 0), device=device or self.Ks.device)
+            return empty_idx, empty_dist
+        return self.surface_module.get_graph(device=device)
+
+    def get_surface_segments(
+        self, device: torch.device | None = None
+    ) -> torch.Tensor:
+        if self.surface_module is None:
+            return torch.empty((0, 2, 3), device=device or self.Ks.device)
+        return self.surface_module.get_graph_segments(device=device)
 
     def enable_knn_graph(self, k: int | None) -> None:
         """

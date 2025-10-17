@@ -80,3 +80,22 @@ class OptimizerConfig:
     cull_opacity_threshold: float = 0.1
     cull_scale_threshold: float = 0.5
     cull_screen_threshold: float = 0.15
+
+
+@dataclass
+class SurfaceModuleConfig:
+    enabled: bool = False
+    mls_neighbors: int = 16
+    projection_iters: int = 3
+    bandwidth_scale: float = 2.0
+    min_bandwidth: float = 1e-3
+    graph_k: int = 6
+    graph_update_every: int = 200
+    snapshot_every: int = 0
+    weight_epsilon: float = 1e-5
+    covariance_reg: float = 1e-6
+    weight_floor: float = 1e-4
+    min_neighbor_weight: float = 1e-2
+    min_neighbor_count: int = 3
+    decimation_radius: float = 0.0
+    max_weight_fraction: float = 0.95

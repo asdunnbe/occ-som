@@ -12,7 +12,12 @@ from nerfview import CameraState
 from pytorch_msssim import SSIM
 from torch.utils.tensorboard import SummaryWriter  # type: ignore
 
-from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
+from flow3d.configs import (
+    LossesConfig,
+    OptimizerConfig,
+    SceneLRConfig,
+    SurfaceModuleConfig,
+)
 from flow3d.loss_utils import (
     compute_gradient_loss,
     compute_se3_smoothness_loss,
@@ -44,6 +49,7 @@ class Trainer:
         gaussian_knn_k: int | None = None,
         graph_save_every: int | None = None,
         viewer_graph_max_edges: int = 0,
+        surface_cfg: SurfaceModuleConfig | None = None,
     ):
         self.device = device
         self.log_every = log_every
@@ -73,6 +79,12 @@ class Trainer:
         self._viewer_graph_handles: list[Any] = []
         self._graph_rng = np.random.default_rng()
 
+        self.surface_cfg = surface_cfg or SurfaceModuleConfig()
+        self.surface_enabled = bool(self.surface_cfg.enabled)
+        self.surface_save_dir = Path(work_dir) / "surface"
+        self._surface_last_graph_step = -1
+        self._surface_initialized = False
+
         self.lr_cfg = lr_cfg
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
@@ -97,6 +109,7 @@ class Trainer:
         self.epoch = 0
 
         self._maybe_initialize_graph()
+        self._maybe_initialize_surface()
 
         self.viewer = None
         if port is not None:
@@ -137,7 +150,12 @@ class Trainer:
 
     @staticmethod
     def init_from_checkpoint(
-        path: str, device: torch.device, use_2dgs, *args, **kwargs
+        path: str,
+        device: torch.device,
+        use_2dgs,
+        *args,
+        surface_cfg: SurfaceModuleConfig | None = None,
+        **kwargs,
     ) -> tuple["Trainer", int]:
         guru.info(f"Loading checkpoint from {path}")
         try:
@@ -149,7 +167,7 @@ class Trainer:
         model = model.to(device)
         print(use_2dgs)
         model.use_2dgs = use_2dgs
-        trainer = Trainer(model, device, *args, **kwargs)
+        trainer = Trainer(model, device, *args, surface_cfg=surface_cfg, **kwargs)
         if "optimizers" in ckpt:
             trainer.load_checkpoint_optimizers(ckpt["optimizers"])
         if "schedulers" in ckpt:
@@ -234,6 +252,7 @@ class Trainer:
         self.log_dict(stats)
         self.global_step += 1
         self._maybe_initialize_graph()
+        self._maybe_initialize_surface()
         self.run_control_steps()
 
         should_save_graph = (
@@ -256,6 +275,25 @@ class Trainer:
             self.model.rebuild_knn_graph()
         if should_save_graph:
             self.save_graph_snapshot()
+
+        if self.surface_enabled and self._surface_initialized:
+            surface_update_due = (
+                self.surface_cfg.graph_update_every > 0
+                and self.global_step > 0
+                and self.global_step % self.surface_cfg.graph_update_every == 0
+            ) or should_update_viewer_graph
+            surface_snapshot_due = (
+                self.surface_cfg.snapshot_every > 0
+                and self.global_step > 0
+                and self.global_step % self.surface_cfg.snapshot_every == 0
+            )
+            if (surface_update_due or surface_snapshot_due) and (
+                self._surface_last_graph_step != self.global_step
+            ):
+                self.model.update_surface_module(force=True)
+                self._surface_last_graph_step = self.global_step
+            if surface_snapshot_due:
+                self.save_surface_snapshot()
 
         if self.viewer is not None:
             self.viewer.lock.release()
@@ -619,6 +657,19 @@ class Trainer:
             f"Initialized Gaussian K-NN graph with k={self.gaussian_knn_k} at step {self.global_step}."
         )
 
+    def _maybe_initialize_surface(self) -> None:
+        if not self.surface_enabled or self._surface_initialized:
+            return
+        warmup_steps = getattr(self.optim_cfg, "warmup_steps", 0)
+        if self.global_step < warmup_steps:
+            return
+        self.model.init_surface_module(self.surface_cfg)
+        self._surface_initialized = True
+        guru.info(
+            f"Initialized surface module at step {self.global_step} "
+            f"(graph_k={self.surface_cfg.graph_k})."
+        )
+
     def _refresh_knn_graph(self) -> None:
         if not self._graph_initialized:
             return
@@ -644,6 +695,31 @@ class Trainer:
         self._last_saved_graph_step = self.global_step
         guru.info(f"Saved gaussian graph snapshot to {out_path}")
 
+    def save_surface_snapshot(self) -> None:
+        if (
+            not self.surface_enabled
+            or not self._surface_initialized
+            or self.model.surface_module is None
+        ):
+            return
+        points = self.model.get_surface_points().detach().cpu()
+        normals = self.model.get_surface_normals().detach().cpu()
+        indices, distances = self.model.get_surface_graph()
+        indices = indices.detach().cpu()
+        distances = distances.detach().cpu()
+        snapshot = {
+            "step": int(self.global_step),
+            "graph_k": int(self.surface_cfg.graph_k),
+            "points": points,
+            "normals": normals,
+            "indices": indices,
+            "distances": distances,
+        }
+        self.surface_save_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.surface_save_dir / f"surface_step_{self.global_step:08d}.pt"
+        torch.save(snapshot, out_path)
+        guru.info(f"Saved surface snapshot to {out_path}")
+
     def _clear_viewer_graph(self) -> None:
         if not self._viewer_graph_handles:
             return
@@ -665,23 +741,74 @@ class Trainer:
         if server is None:
             return
 
-        segments = self.model.get_knn_segments()
-        if segments.numel() == 0:
+        gaussian_segments = self.model.get_knn_segments()
+        surface_segments = torch.empty((0, 2, 3), device=gaussian_segments.device)
+        if (
+            self.surface_enabled
+            and self._surface_initialized
+            and self.model.surface_module is not None
+        ):
+            surface_segments = self.model.get_surface_segments()
+
+        gaussian_np = (
+            gaussian_segments.detach().cpu().numpy()
+            if gaussian_segments.numel() > 0
+            else np.empty((0, 2, 3), dtype=np.float32)
+        )
+        surface_np = (
+            surface_segments.detach().cpu().numpy()
+            if surface_segments.numel() > 0
+            else np.empty((0, 2, 3), dtype=np.float32)
+        )
+
+        if gaussian_np.shape[0] == 0 and surface_np.shape[0] == 0:
             self._clear_viewer_graph()
             return
-        segments_np = segments.detach().cpu().numpy()
-        num_edges = segments_np.shape[0]
-        if num_edges > self.viewer_graph_max_edges:
-            choice = self._graph_rng.choice(
-                num_edges, size=self.viewer_graph_max_edges, replace=False
-            )
-            segments_np = segments_np[choice]
 
-        weights = np.linalg.norm(segments_np[:, 0] - segments_np[:, 1], axis=-1)
-        if weights.size == 0:
-            weights_norm = np.zeros_like(weights)
+        max_edges = max(0, self.viewer_graph_max_edges)
+        if gaussian_np.shape[0] > 0 and surface_np.shape[0] > 0 and max_edges > 0:
+            gaussian_limit = max(1, max_edges // 2)
+            surface_limit = max(0, max_edges - gaussian_limit)
+        elif gaussian_np.shape[0] > 0:
+            gaussian_limit = max_edges
+            surface_limit = 0
         else:
-            weights_norm = (weights - weights.min()) / (weights.ptp() + 1e-8)
+            gaussian_limit = 0
+            surface_limit = max_edges
+
+        if gaussian_limit > 0 and gaussian_np.shape[0] > gaussian_limit:
+            choice = self._graph_rng.choice(
+                gaussian_np.shape[0], size=gaussian_limit, replace=False
+            )
+            gaussian_np = gaussian_np[choice]
+        if surface_limit > 0 and surface_np.shape[0] > surface_limit:
+            choice = self._graph_rng.choice(
+                surface_np.shape[0], size=surface_limit, replace=False
+            )
+            surface_np = surface_np[choice]
+        if gaussian_limit == 0:
+            gaussian_np = gaussian_np[:0]
+        if surface_limit == 0:
+            surface_np = surface_np[:0]
+
+        gaussian_weights = (
+            np.linalg.norm(gaussian_np[:, 0] - gaussian_np[:, 1], axis=-1)
+            if gaussian_np.size > 0
+            else np.empty(0, dtype=np.float32)
+        )
+        surface_weights = (
+            np.linalg.norm(surface_np[:, 0] - surface_np[:, 1], axis=-1)
+            if surface_np.size > 0
+            else np.empty(0, dtype=np.float32)
+        )
+        if gaussian_weights.size > 0:
+            gaussian_weights = (gaussian_weights - gaussian_weights.min()) / (
+                gaussian_weights.ptp() + 1e-8
+            )
+        if surface_weights.size > 0:
+            surface_weights = (surface_weights - surface_weights.min()) / (
+                surface_weights.ptp() + 1e-8
+            )
 
         self._clear_viewer_graph()
         handles: list[Any] = []
@@ -694,18 +821,51 @@ class Trainer:
             )
             handles.append(
                 server.scene.add_point_cloud(
-                    "/graph/nodes",
+                    "/graph/gaussian_nodes",
                     points=node_positions,
                     colors=node_colors,
                     point_size=0.01,
                 )
             )
 
-        for idx, (segment, wn) in enumerate(zip(segments_np, weights_norm)):
+        if (
+            self.surface_enabled
+            and self._surface_initialized
+            and self.model.surface_module is not None
+        ):
+            surface_pts_tensor = self.model.get_surface_points()
+            if surface_pts_tensor.numel() > 0:
+                surface_nodes = surface_pts_tensor.detach().cpu().numpy()
+                surface_colors = np.tile(
+                    np.array([[0.95, 0.55, 0.2]], dtype=np.float32),
+                    (surface_nodes.shape[0], 1),
+                )
+                handles.append(
+                    server.scene.add_point_cloud(
+                        "/graph/surface_nodes",
+                        points=surface_nodes,
+                        colors=surface_colors,
+                        point_size=0.008,
+                    )
+                )
+
+        for idx, (segment, wn) in enumerate(zip(gaussian_np, gaussian_weights)):
             color = (float(wn), float(1.0 - wn), 0.2)
             handles.append(
                 server.scene.add_spline_catmull_rom(
-                    f"/graph/edges/{idx}",
+                    f"/graph/gaussian_edges/{idx}",
+                    positions=segment,
+                    color=color,
+                    segments=1,
+                    line_width=0.002,
+                )
+            )
+
+        for idx, (segment, wn) in enumerate(zip(surface_np, surface_weights)):
+            color = (0.95, float(0.2 + 0.6 * (1.0 - wn)), 0.25)
+            handles.append(
+                server.scene.add_spline_catmull_rom(
+                    f"/graph/surface_edges/{idx}",
                     positions=segment,
                     color=color,
                     segments=1,
